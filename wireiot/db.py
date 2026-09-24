@@ -32,4 +32,20 @@ def init():
                 device text NOT NULL, bucket timestamptz NOT NULL, revision bigint NOT NULL,
                 active boolean NOT NULL, mean numeric NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
                 PRIMARY KEY(device,bucket,revision));
+            ALTER TABLE devices ADD COLUMN IF NOT EXISTS rule_revision integer NOT NULL DEFAULT 1;
+            ALTER TABLE devices ADD COLUMN IF NOT EXISTS key_revision integer NOT NULL DEFAULT 1;
+            ALTER TABLE devices ADD COLUMN IF NOT EXISTS served_at timestamptz NOT NULL DEFAULT '-infinity';
+            ALTER TABLE windows ADD COLUMN IF NOT EXISTS rule_version integer NOT NULL DEFAULT 1;
+            ALTER TABLE windows ADD COLUMN IF NOT EXISTS dirty boolean NOT NULL DEFAULT false;
+            ALTER TABLE transitions ADD COLUMN IF NOT EXISTS rule_version integer NOT NULL DEFAULT 1;
+            ALTER TABLE transitions ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT 'telemetry';
+            CREATE TABLE IF NOT EXISTS rules (
+                device text REFERENCES devices(id),version integer NOT NULL,effective_at timestamptz NOT NULL,
+                threshold numeric(12,3) NOT NULL,aggregate text NOT NULL,minimum_count integer NOT NULL,
+                PRIMARY KEY(device,version));
+            INSERT INTO rules SELECT id,1,'-infinity',threshold,'mean',1 FROM devices ON CONFLICT DO NOTHING;
+            CREATE INDEX IF NOT EXISTS rule_lookup ON rules(device,effective_at DESC,version DESC);
+            CREATE TABLE IF NOT EXISTS key_changes (
+                device text NOT NULL,revision integer NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY(device,revision));
         """)

@@ -24,7 +24,7 @@ def ingest(device, token, event, now=None):
     bucket = timestamp.replace(second=0, microsecond=0)
     with connect() as conn:
         registered = conn.execute(
-            "SELECT * FROM devices WHERE id=%s FOR UPDATE", (device,)
+            "SELECT token_hash FROM devices WHERE id=%s FOR UPDATE", (device,)
         ).fetchone()
         if not registered or not secrets.compare_digest(
             registered["token_hash"], hashlib.sha256(token.encode()).hexdigest()
@@ -49,10 +49,57 @@ def ingest(device, token, event, now=None):
         return {"duplicate": False, "included": included}
 
 
+def evaluate(conn, window, reason):
+    rule = conn.execute(
+        "SELECT version,threshold,aggregate,minimum_count FROM rules WHERE device=%s AND effective_at<=%s ORDER BY effective_at DESC,version DESC LIMIT 1",
+        (window["device"], window["bucket"]),
+    ).fetchone()
+    mean = window["total"] / window["count"]
+    measured = mean if rule["aggregate"] == "mean" else window[rule["aggregate"]]
+    active = window["count"] >= rule["minimum_count"] and measured >= rule["threshold"]
+    if active != window["active"] or rule["version"] != window["rule_version"]:
+        conn.execute(
+            "INSERT INTO transitions(device,bucket,revision,active,mean,rule_version,reason) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (
+                window["device"],
+                window["bucket"],
+                window["revision"],
+                active,
+                mean,
+                rule["version"],
+                reason,
+            ),
+        )
+    conn.execute(
+        "UPDATE windows SET active=%s,rule_version=%s,dirty=false WHERE device=%s AND bucket=%s",
+        (active, rule["version"], window["device"], window["bucket"]),
+    )
+
+
 def tick():
     with connect() as conn:
+        # Общий порядок блокировок: устройство, затем событие и окно. Правило не меняется посреди оценки.
+        device = conn.execute("""SELECT d.id FROM devices d WHERE EXISTS (
+            SELECT 1 FROM events e WHERE e.device=d.id AND NOT e.processed)
+            OR EXISTS(SELECT 1 FROM windows w WHERE w.device=d.id AND w.dirty)
+            ORDER BY d.served_at,d.id FOR UPDATE OF d SKIP LOCKED LIMIT 1""").fetchone()
+        if not device:
+            return False
+        conn.execute("UPDATE devices SET served_at=clock_timestamp() WHERE id=%s", (device["id"],))
+        dirty = conn.execute(
+            "SELECT * FROM windows WHERE device=%s AND dirty ORDER BY bucket LIMIT 1 FOR UPDATE",
+            (device["id"],),
+        ).fetchone()
+        if dirty:
+            window = conn.execute(
+                "UPDATE windows SET revision=revision+1 WHERE device=%s AND bucket=%s RETURNING *",
+                (device["id"], dirty["bucket"]),
+            ).fetchone()
+            evaluate(conn, window, "rule_change")
+            return True
         event = conn.execute(
-            "SELECT * FROM events WHERE NOT processed ORDER BY received_at,device,id LIMIT 1 FOR UPDATE SKIP LOCKED"
+            "SELECT * FROM events WHERE device=%s AND NOT processed ORDER BY received_at,id LIMIT 1 FOR UPDATE",
+            (device["id"],),
         ).fetchone()
         if not event:
             return False
@@ -65,20 +112,7 @@ def tick():
                 revision=windows.revision+1 RETURNING *""",
                 (event["device"], event["bucket"], event["value"], event["value"], event["value"]),
             ).fetchone()
-            threshold = conn.execute(
-                "SELECT threshold FROM devices WHERE id=%s", (event["device"],)
-            ).fetchone()["threshold"]
-            mean = window["total"] / window["count"]
-            active = mean >= threshold
-            if active != window["active"]:
-                conn.execute(
-                    "UPDATE windows SET active=%s WHERE device=%s AND bucket=%s",
-                    (active, event["device"], event["bucket"]),
-                )
-                conn.execute(
-                    "INSERT INTO transitions(device,bucket,revision,active,mean) VALUES (%s,%s,%s,%s,%s)",
-                    (event["device"], event["bucket"], window["revision"], active, mean),
-                )
+            evaluate(conn, window, "telemetry")
         conn.execute(
             "UPDATE events SET processed=true WHERE device=%s AND id=%s",
             (event["device"], event["id"]),

@@ -109,3 +109,71 @@ def test_http_device_auth_and_registration_conflict(client):
         == 401
     )
     assert client.post("/devices", json={"id": "sensor"}).status_code == 409
+
+
+def test_rule_version_rebuild_preserves_data_and_retracts_alert(client):
+    token = device(client)
+    bucket = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=1)
+    ingest("sensor", token, event("80", bucket))
+    drain()
+    before = client.get("/devices/sensor/windows").json()[0]
+    assert before["active"]
+    body = {
+        "expected_revision": 1,
+        "effective_at": bucket.isoformat(),
+        "threshold": 90,
+        "aggregate": "maximum",
+        "minimum_count": 1,
+    }
+    changed = client.post("/devices/sensor/rules", json=body)
+    assert changed.json() == {"version": 2, "windows_queued": 1}
+    assert client.post("/devices/sensor/rules", json=body).status_code == 409
+    drain()
+    after = client.get("/devices/sensor/windows").json()[0]
+    assert after["count"] == before["count"]
+    assert after["total"] == before["total"]
+    assert after["rule_version"] == 2
+    assert not after["active"]
+    transition = client.get("/devices/sensor/alerts").json()[-1]
+    assert transition["reason"] == "rule_change"
+    assert transition["rule_version"] == 2
+
+
+def test_future_rule_does_not_rewrite_earlier_bucket(client):
+    token = device(client)
+    bucket = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=2)
+    ingest("sensor", token, event("80", bucket))
+    body = {
+        "expected_revision": 1,
+        "effective_at": (bucket + timedelta(minutes=1)).isoformat(),
+        "threshold": 100,
+        "minimum_count": 2,
+    }
+    assert client.post("/devices/sensor/rules", json=body).status_code == 200
+    drain()
+    before = client.get("/devices/sensor/windows").json()[0]
+    assert before["active"]
+    assert before["rule_version"] == 1
+    ingest("sensor", token, event("100", bucket + timedelta(minutes=1)))
+    drain()
+    assert not client.get("/devices/sensor/windows").json()[0]["active"]
+    ingest("sensor", token, event("100", bucket + timedelta(minutes=1, seconds=1)))
+    drain()
+    assert client.get("/devices/sensor/windows").json()[0]["active"]
+
+
+def test_key_rotation_revokes_old_key_without_faking_liveness(client):
+    old = device(client)
+    with connect() as conn:
+        conn.execute("UPDATE devices SET last_received=now()-interval '10 seconds'")
+    response = client.post("/devices/sensor/rotate-key", json={"expected_revision": 1})
+    new = response.json()["token"]
+    assert new != old
+    assert client.get("/devices").json()[0]["offline"]
+    assert (
+        client.post("/devices/sensor/rotate-key", json={"expected_revision": 1}).status_code == 409
+    )
+    with pytest.raises(PermissionError):
+        ingest("sensor", old, event("10"))
+    ingest("sensor", new, event("10"))
+    assert not client.get("/devices").json()[0]["offline"]

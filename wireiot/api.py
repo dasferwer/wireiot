@@ -3,8 +3,9 @@ import os
 import secrets
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
 
 import pika
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -51,7 +52,10 @@ def register(body: Device):
         ).fetchone()
         if not inserted:
             raise HTTPException(409, "Устройство уже зарегистрировано")
-    return {"id": body.id, "token": token}
+        conn.execute(
+            "INSERT INTO rules VALUES (%s,1,'-infinity',%s,'mean',1)", (body.id, body.threshold)
+        )
+    return {"id": body.id, "token": token, "key_revision": 1}
 
 
 @app.post("/devices/{device}/events")
@@ -111,3 +115,70 @@ def health():
     with connect() as conn:
         conn.execute("SELECT 1")
     return {"status": "ok"}
+
+
+class Rule(BaseModel):
+    expected_revision: int = Field(ge=1)
+    effective_at: datetime
+    threshold: Decimal = Field(ge=-1000, le=1000, decimal_places=3)
+    aggregate: Literal["mean", "minimum", "maximum"] = "mean"
+    minimum_count: int = Field(default=1, ge=1, le=100000)
+
+
+@app.post("/devices/{device}/rules", dependencies=[Depends(authorize)])
+def change_rule(device: str, body: Rule):
+    instant = body.effective_at
+    if (
+        instant.tzinfo is None
+        or instant.second
+        or instant.microsecond
+        or instant < datetime.now(UTC) - timedelta(days=1)
+    ):
+        raise HTTPException(422, "Нужна граница минуты с часовым поясом не старше суток")
+    with connect() as conn:
+        current = conn.execute(
+            "SELECT rule_revision FROM devices WHERE id=%s FOR UPDATE", (device,)
+        ).fetchone()
+        if current is None:
+            raise HTTPException(404, "Устройство не найдено")
+        if current["rule_revision"] != body.expected_revision:
+            raise HTTPException(409, "Версия правил изменилась")
+        version = body.expected_revision + 1
+        conn.execute(
+            "INSERT INTO rules VALUES (%s,%s,%s,%s,%s,%s)",
+            (device, version, instant, body.threshold, body.aggregate, body.minimum_count),
+        )
+        conn.execute("UPDATE devices SET rule_revision=%s WHERE id=%s", (version, device))
+        count = conn.execute(
+            "UPDATE windows SET dirty=true WHERE device=%s AND bucket>=%s", (device, instant)
+        ).rowcount
+    return {"version": version, "windows_queued": count}
+
+
+@app.get("/devices/{device}/rules", dependencies=[Depends(authorize)])
+def rules(device: str):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT device,version,effective_at::text,threshold,aggregate,minimum_count FROM rules WHERE device=%s ORDER BY version",
+            (device,),
+        ).fetchall()
+
+
+class Rotation(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+@app.post("/devices/{device}/rotate-key", dependencies=[Depends(authorize)])
+def rotate(device: str, body: Rotation):
+    token = secrets.token_urlsafe(32)
+    with connect() as conn:
+        row = conn.execute(
+            "UPDATE devices SET token_hash=%s,key_revision=key_revision+1 WHERE id=%s AND key_revision=%s RETURNING key_revision",
+            (hashlib.sha256(token.encode()).hexdigest(), device, body.expected_revision),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(409, "Устройство не найдено или ключ уже изменён")
+        conn.execute(
+            "INSERT INTO key_changes(device,revision) VALUES (%s,%s)", (device, row["key_revision"])
+        )
+    return {"token": token, "key_revision": row["key_revision"]}
