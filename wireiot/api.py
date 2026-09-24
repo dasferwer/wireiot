@@ -85,7 +85,7 @@ def receive(device: str, body: Event, x_device_key: str = Header(default="")):
 def devices():
     with connect() as conn:
         return conn.execute(
-            "SELECT id,threshold,timeout,last_received,now()-last_received>timeout*interval '1 second' AS offline FROM devices ORDER BY id"
+            "SELECT id,threshold,timeout,key_revision,rule_revision,last_received,now()-last_received>timeout*interval '1 second' AS offline FROM devices ORDER BY id"
         ).fetchall()
 
 
