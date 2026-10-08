@@ -1,16 +1,21 @@
-import json
 import logging
 import os
+import re
 import time
 
 import paho.mqtt.client as mqtt
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, StrictStr, ValidationError
 
 from wireiot.api import Event
 from wireiot.db import init
 from wireiot.service import Rejected, ingest
 
 logger = logging.getLogger(__name__)
+
+
+class Envelope(BaseModel):
+    token: StrictStr = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    event: Event
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -26,10 +31,15 @@ def on_message(client, userdata, message):
     try:
         if len(message.payload) > 8192:
             raise Rejected("Слишком большое сообщение")
-        payload = json.loads(message.payload)
-        ingest(
-            message.topic.split("/")[1], payload["token"], Event.model_validate(payload["event"])
-        )
+        topic = message.topic.split("/")
+        if (
+            len(topic) != 2
+            or topic[0] != "telemetry"
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", topic[1])
+        ):
+            raise Rejected("Неверный topic устройства")
+        envelope = Envelope.model_validate_json(message.payload)
+        ingest(topic[1], envelope.token, envelope.event)
     except (Rejected, PermissionError, ValidationError, ValueError, KeyError, TypeError):
         logger.warning("Некорректное MQTT-событие отклонено")
         client.ack(message.mid, message.qos)

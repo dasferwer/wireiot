@@ -7,6 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: postgresql://demo:demo@localhost:54837/wireiot
+      MQTT_TEST_HOST: 127.0.0.1
+      MQTT_TEST_PORT: "18837"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
